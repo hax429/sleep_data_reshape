@@ -1,0 +1,2 @@
+subjectkey,src_subject_id,interview_date,interview_age,sex,mt_pilot_vib_device,length_per,max_devdays,actual_devdays,tlfb_daynum,day_code,site_time_zone,utc_offset,dc_start_date,dc_start_time,dc_end_date,dc_end_time,watch_device_type,device_timestamp,accel_x,accel_y,accel_z
+,,,,,,,,,,,,,,,,,,,,

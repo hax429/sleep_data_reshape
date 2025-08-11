@@ -1,0 +1,5 @@
+data/
+output/
+.claude/
+.idea/
+.DS_Store
