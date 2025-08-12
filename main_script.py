@@ -17,17 +17,20 @@ import logging
 import re
 import pytz
 import platform
-from datetime import datetime
+from datetime import datetime, timedelta
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
+from dateutil.relativedelta import relativedelta
 
 # =============================================================================
 # CONFIGURATION SECTION - All user inputs and defaults
 # =============================================================================
 
 # Default paths
-DEFAULT_OUTPUT_FOLDER = '/Users/hax429/Developer/Internship/reshape/data/output'
-DEFAULT_METADATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'metadata.csv')
+DEFAULT_OUTPUT_FOLDER = os.path.join('data', 'output')
+DEFAULT_METADATA_PATH = os.path.join('data', 'metadata.csv')
+DEFAULT_LOGS_FOLDER = 'logs'
+DEFAULT_PARTICIPANTS_FOLDER = os.path.join('..', 'final_processed_study_parquet')
 
 # Default processing settings
 DEFAULT_PROCESSING_MODE = 'single'  # Options: 'single', 'cpu', 'gpu'
@@ -42,7 +45,6 @@ PROCESSING_MODES = {
 
 # User prompts and defaults
 PROMPTS = {
-    'directory_path': "Enter the directory path containing the four parquet files: ",
     'processing_mode': f"Processing mode (cpu/gpu/single, default: {DEFAULT_PROCESSING_MODE}): ",
     'output_folder': f"Enter output folder (default: '{DEFAULT_OUTPUT_FOLDER}'): ",
     'metadata_path': f"Enter metadata CSV file path (default: '{DEFAULT_METADATA_PATH}'): ",
@@ -125,6 +127,7 @@ class ProcessLogger:
         log_dir = os.path.dirname(self.log_file)
         if log_dir and not os.path.exists(log_dir):
             os.makedirs(log_dir)
+            print(f"Created logs directory: {log_dir}")
         
         file_handler = logging.FileHandler(self.log_file, mode='a')
         file_handler.setLevel(logging.DEBUG)
@@ -293,6 +296,313 @@ def get_utc_offset(timezone_series):
     except Exception:
         return ''
 
+# Global birth date cache to avoid recalculating for the same participant
+_birth_date_cache = {}
+
+def clear_birth_date_cache():
+    """Clear the birth date cache."""
+    global _birth_date_cache
+    _birth_date_cache.clear()
+    log_info("Birth date cache cleared")
+
+def get_cache_info():
+    """Get information about the current cache state."""
+    return f"Birth date cache contains {len(_birth_date_cache)} entries: {list(_birth_date_cache.keys())}"
+
+def discover_participants(base_directory=None):
+    """Discover all participant folders (SP*) in the participants directory."""
+    if base_directory is None:
+        base_directory = DEFAULT_PARTICIPANTS_FOLDER
+    if not os.path.exists(base_directory):
+        return []
+    
+    participants = []
+    try:
+        for item in os.listdir(base_directory):
+            full_path = os.path.join(base_directory, item)
+            if os.path.isdir(full_path) and item.startswith('SP') and len(item) >= 3:
+                # Extract numeric part for sorting
+                try:
+                    participant_num = int(item[2:])  # Extract number after "SP"
+                    participants.append((participant_num, item, full_path))
+                except ValueError:
+                    # Skip folders that don't have valid numeric suffix
+                    continue
+        
+        # Sort by participant number
+        participants.sort(key=lambda x: x[0])
+        return [(folder, path) for _, folder, path in participants]
+        
+    except Exception as e:
+        log_warning(f"Error discovering participants: {e}")
+        return []
+
+def display_participants(participants):
+    """Display available participants in a formatted way."""
+    if not participants:
+        print("No participant folders found.")
+        return
+    
+    print(f"\nFound {len(participants)} participants:")
+    print("=" * 60)
+    
+    # Display in columns for better readability
+    cols = 4
+    for i in range(0, len(participants), cols):
+        row_participants = participants[i:i+cols]
+        row_text = ""
+        for j, (folder, _) in enumerate(row_participants):
+            row_text += f"{i+j+1:2d}. {folder:<8}"
+        print(row_text)
+    
+    print("=" * 60)
+
+def get_participant_selection(participants):
+    """Get user selection of participants to process."""
+    if not participants:
+        return []
+    
+    display_participants(participants)
+    print("\nSelection options:")
+    print("  -1 or 'all': Process ALL participants")
+    print("  Single number: Process one participant (e.g., 1)")
+    print("  Multiple numbers: Process multiple participants (e.g., 1,3,5)")
+    print("  Range: Process range of participants (e.g., 1-5)")
+    print("  Mixed: Combine options (e.g., 1,3-5,7)")
+    
+    while True:
+        try:
+            selection = input(f"\nSelect participants to process (1-{len(participants)}, -1 for all): ").strip()
+            
+            if selection.lower() in ['-1', 'all']:
+                return participants
+            
+            if not selection:
+                print("Error: Please enter a selection.")
+                continue
+            
+            selected_indices = set()
+            
+            # Parse different selection formats
+            parts = selection.split(',')
+            for part in parts:
+                part = part.strip()
+                if '-' in part and not part.startswith('-'):
+                    # Range selection (e.g., 1-5)
+                    try:
+                        start, end = part.split('-', 1)
+                        start_idx = int(start.strip()) - 1
+                        end_idx = int(end.strip()) - 1
+                        if 0 <= start_idx < len(participants) and 0 <= end_idx < len(participants):
+                            for i in range(start_idx, end_idx + 1):
+                                selected_indices.add(i)
+                        else:
+                            print(f"Error: Range {part} is out of bounds (1-{len(participants)})")
+                            raise ValueError("Invalid range")
+                    except ValueError:
+                        print(f"Error: Invalid range format '{part}'. Use format like '1-5'")
+                        break
+                else:
+                    # Single number
+                    try:
+                        idx = int(part) - 1
+                        if 0 <= idx < len(participants):
+                            selected_indices.add(idx)
+                        else:
+                            print(f"Error: {int(part)} is out of bounds (1-{len(participants)})")
+                            raise ValueError("Out of bounds")
+                    except ValueError:
+                        print(f"Error: Invalid number '{part}'")
+                        break
+            else:
+                # If we didn't break out of the loop, selection is valid
+                if selected_indices:
+                    selected_participants = [participants[i] for i in sorted(selected_indices)]
+                    
+                    # Confirm selection
+                    print(f"\nSelected {len(selected_participants)} participants:")
+                    for folder, _ in selected_participants:
+                        print(f"  - {folder}")
+                    
+                    confirm = input("\nProceed with this selection? (y/n, default: y): ").strip().lower()
+                    if confirm in ['', 'y', 'yes']:
+                        return selected_participants
+                    else:
+                        print("Selection cancelled. Please choose again.")
+                        continue
+                else:
+                    print("Error: No valid participants selected.")
+                    continue
+                    
+        except KeyboardInterrupt:
+            print("\n\nSelection cancelled by user.")
+            return []
+        except Exception as e:
+            print(f"Error: {e}. Please try again.")
+            continue
+
+def load_visit_data_and_calculate_birth_date(visit_csv_path, subject_id_int):
+    """Load visit data and calculate possible date of birth for a subject with verification."""
+    # Check cache first
+    if subject_id_int in _birth_date_cache:
+        cached_birth_date = _birth_date_cache[subject_id_int]
+        log_info(f"Using cached birth date for subject {subject_id_int}: {cached_birth_date.strftime('%Y-%m-%d')}")
+        return cached_birth_date, []
+    
+    if not os.path.exists(visit_csv_path):
+        log_warning(f"visit_converted.csv not found at {visit_csv_path}")
+        return None, []
+    
+    try:
+        visit_df = pd.read_csv(visit_csv_path)
+        subject_rows = visit_df[visit_df['src_subject_id'] == f"{subject_id_int:03d}--1"]
+        
+        if subject_rows.empty:
+            log_warning(f"No visit data found for subject ID {subject_id_int} (padded: {subject_id_int:03d}--1)")
+            return None, []
+        
+        # Convert interview_date to datetime
+        subject_rows = subject_rows.copy()
+        subject_rows['interview_date'] = pd.to_datetime(subject_rows['interview_date'])
+        
+        # Sort by interview date
+        subject_rows = subject_rows.sort_values('interview_date')
+        
+        log_info(f"Found {len(subject_rows)} interview entries for subject {subject_id_int}:")
+        for _, row in subject_rows.iterrows():
+            log_info(f"  Date: {row['interview_date'].strftime('%Y-%m-%d')}, Age: {row['interview_age']} months")
+        
+        # Calculate possible birth date using multiple data points for better accuracy
+        birth_dates = []
+        for _, row in subject_rows.iterrows():
+            # Calculate birth date from this interview
+            interview_date = row['interview_date']
+            age_months = row['interview_age']
+            
+            # Subtract age in months from interview date
+            birth_date = interview_date - relativedelta(months=age_months)
+            birth_dates.append(birth_date)
+            log_info(f"  Calculated birth date from {interview_date.strftime('%Y-%m-%d')}: {birth_date.strftime('%Y-%m-%d')}")
+        
+        # Use the most common birth date (or average if they're close)
+        if birth_dates:
+            # Calculate the median birth date for consistency
+            sorted_dates = sorted(birth_dates)
+            median_date = sorted_dates[len(sorted_dates) // 2]
+            
+            log_info(f"Initial inferred birth date for subject {subject_id_int}: {median_date.strftime('%Y-%m-%d')}")
+            
+            # Verify the birth date against all entries
+            verified_birth_date = verify_birth_date_against_interviews(median_date, subject_rows)
+            
+            # Cache the verified birth date
+            _birth_date_cache[subject_id_int] = verified_birth_date
+            
+            return verified_birth_date, subject_rows.to_dict('records')
+        
+        return None, []
+        
+    except Exception as e:
+        log_warning(f"Could not process visit_converted.csv: {e}")
+        return None, []
+
+def verify_birth_date_against_interviews(birth_date, interview_data):
+    """Verify that the calculated birth date is consistent with all interview entries."""
+    log_info("Verifying birth date against all interview entries:")
+    
+    max_deviation = 0
+    total_deviation = 0
+    acceptable_entries = 0
+    
+    for _, row in interview_data.iterrows():
+        interview_date = row['interview_date']
+        reported_age = row['interview_age']
+        
+        # Calculate age from birth date to interview date
+        calculated_age_delta = relativedelta(interview_date.date(), birth_date.date())
+        calculated_age_months = calculated_age_delta.years * 12 + calculated_age_delta.months
+        
+        deviation = abs(calculated_age_months - reported_age)
+        max_deviation = max(max_deviation, deviation)
+        total_deviation += deviation
+        
+        status = "✓" if deviation <= 1 else "⚠" if deviation <= 2 else "✗"
+        log_info(f"  {status} {interview_date.strftime('%Y-%m-%d')}: Reported={reported_age}, Calculated={calculated_age_months}, Deviation={deviation} months")
+        
+        if deviation <= 1:  # Accept within 1 month tolerance
+            acceptable_entries += 1
+    
+    avg_deviation = total_deviation / len(interview_data) if len(interview_data) > 0 else 0
+    acceptance_rate = acceptable_entries / len(interview_data) if len(interview_data) > 0 else 0
+    
+    log_info(f"Birth date verification summary:")
+    log_info(f"  - Maximum deviation: {max_deviation} months")
+    log_info(f"  - Average deviation: {avg_deviation:.1f} months") 
+    log_info(f"  - Entries within 1 month: {acceptable_entries}/{len(interview_data)} ({acceptance_rate:.1%})")
+    
+    if acceptance_rate >= 0.8:  # At least 80% of entries should be within 1 month
+        log_info(f"✓ Birth date verification PASSED: {birth_date.strftime('%Y-%m-%d')}")
+        return birth_date
+    else:
+        log_warning(f"⚠ Birth date verification shows high deviation. Using calculated date with caution: {birth_date.strftime('%Y-%m-%d')}")
+        return birth_date
+
+def get_device_type_from_participant_id(subject_id_int):
+    """Determine device type based on participant ID range."""
+    if 1 <= subject_id_int < 84:
+        return "Empatica E4"
+    else:
+        # For participants 84 and above, return empty or could be set to other device types
+        return ""
+
+def calculate_interview_age_from_timestamp(timestamp_series, birth_date):
+    """Calculate interview age in months from timestamp_local and birth date for each row."""
+    if birth_date is None or timestamp_series.empty:
+        return pd.Series([''] * len(timestamp_series))
+    
+    try:
+        ages = []
+        valid_timestamps = 0
+        for timestamp in timestamp_series:
+            if timestamp is None or pd.isna(timestamp):
+                ages.append('')
+            else:
+                # Calculate age in months for this specific timestamp
+                age_delta = relativedelta(timestamp.date(), birth_date.date())
+                age_months = age_delta.years * 12 + age_delta.months
+                ages.append(int(round(age_months)))
+                valid_timestamps += 1
+        
+        # Log summary of age calculation
+        if valid_timestamps > 0:
+            valid_ages = [age for age in ages if age != '']
+            if valid_ages:
+                min_age = min(valid_ages)
+                max_age = max(valid_ages)
+                log_info(f"Calculated interview_age for {len(valid_ages):,} entries: range {min_age}-{max_age} months")
+                
+                # Log first and last few entries for verification
+                first_timestamps = timestamp_series.dropna().head(3)
+                last_timestamps = timestamp_series.dropna().tail(3)
+                
+                log_info("Sample age calculations:")
+                for ts in first_timestamps:
+                    age_delta = relativedelta(ts.date(), birth_date.date())
+                    age_months = age_delta.years * 12 + age_delta.months
+                    log_info(f"  {ts.strftime('%Y-%m-%d')}: {age_months} months")
+                
+                if len(timestamp_series.dropna()) > 6:  # Only show "last" if we have more than 6 entries
+                    log_info("  ...")
+                    for ts in last_timestamps:
+                        age_delta = relativedelta(ts.date(), birth_date.date())
+                        age_months = age_delta.years * 12 + age_delta.months
+                        log_info(f"  {ts.strftime('%Y-%m-%d')}: {age_months} months")
+        
+        return pd.Series(ages)
+    except Exception as e:
+        log_warning(f"Error calculating interview ages: {e}")
+        return pd.Series([''] * len(timestamp_series))
+
 def calculate_day_codes(timestamp_series):
     """Calculate day codes for timestamp series."""
     if timestamp_series.empty:
@@ -458,6 +768,7 @@ class DataFrameBuilder:
     def __init__(self, metadata_path=None):
         self.logger = LoggerManager.get_logger()
         self.metadata_path = metadata_path
+        self.visit_csv_path = os.path.join('data', 'visit_converted.csv')
     
     def create_output_dataframe(self, df, parquet_file_path):
         """Create output dataframe with proper column mapping and transformations."""
@@ -476,9 +787,12 @@ class DataFrameBuilder:
             metadata_path = DEFAULT_METADATA_PATH
         subject_key_value, sex_value = load_metadata(metadata_path, subject_id_int)
         
+        # Load visit data and calculate birth date
+        birth_date, visit_entries = load_visit_data_and_calculate_birth_date(self.visit_csv_path, subject_id_int)
+        
         output_df = self._build_dataframe(
             df, participant_id, data_type, subject_id_padded,
-            subject_key_value, sex_value, parquet_file_path
+            subject_key_value, sex_value, parquet_file_path, birth_date
         )
         
         log_info(f"Dataframe structure created successfully for {participant_id} {data_type.upper()} ({len(output_df):,} rows)")
@@ -486,12 +800,23 @@ class DataFrameBuilder:
         return output_df
     
     def _build_dataframe(self, df, participant_id, data_type, subject_id_padded,
-                        subject_key_value, sex_value, parquet_file_path):
+                        subject_key_value, sex_value, parquet_file_path, birth_date=None):
         """Internal method to build the output dataframe structure."""
         subject_key_data = pd.Series([subject_key_value] * len(df))
         sex_data = pd.Series([sex_value] * len(df))
         
         interview_date_data = self._get_interview_date(df)
+        
+        # Calculate interview age based on birth date and timestamp_local
+        interview_age_data = calculate_interview_age_from_timestamp(
+            df.get('timestamp_local', pd.Series()), birth_date
+        )
+        
+        # Determine device type based on participant ID
+        subject_id_int = int(participant_id)  # Convert padded ID to integer
+        device_type = get_device_type_from_participant_id(subject_id_int)
+        log_info(f"Device type for participant {subject_id_int}: {device_type}")
+        
         timezone_data = get_timezone_abbreviation(df.get('timezone', pd.Series()))
         utc_offset_data = get_utc_offset(df.get('timezone', pd.Series()))
         day_code_data = calculate_day_codes(df.get('timestamp_local', pd.Series()))
@@ -513,9 +838,9 @@ class DataFrameBuilder:
             'subjectkey': subject_key_data,
             'src_subject_id': subject_id_padded,
             'interview_date': interview_date_data,
-            'interview_age': df.get('interview_age', pd.Series([''] * len(df))),
+            'interview_age': interview_age_data,
             'sex': sex_data,
-            'mt_pilot_vib_device': df.get('mt_pilot_vib_device', pd.Series([''] * len(df))),
+            'mt_pilot_vib_device': pd.Series([device_type] * len(df)),
             'length_per': length_per,
             'max_devdays': length_per,
             'actual_devdays': actual_dev_days,
@@ -527,6 +852,7 @@ class DataFrameBuilder:
             'dc_start_time': dc_start_time_data,
             'dc_end_date': dc_end_date_data,
             'dc_end_time': dc_end_time_data,
+            'watch_device_type': pd.Series([device_type] * len(df)),
             'device_position': device_position,
             'device_timestamp': device_timestamp_data
         }
@@ -832,36 +1158,41 @@ class TransformApplication:
         """Collect all user configuration through interactive prompts."""
         config = {}
         
-        config['directory_path'] = self._get_directory_path()
+        # First, discover and select participants
+        config['selected_participants'] = self._get_participant_selection()
+        if not config['selected_participants']:
+            print("No participants selected. Exiting...")
+            sys.exit(0)
+        
         config['processing_mode'] = self._get_processing_mode()
         config['file_row_limits'] = self._get_row_limits()
         config['output_folder'] = self._get_output_folder()
         config['metadata_path'] = self._get_metadata_path()
         
-        config['log_file'] = generate_log_filename(config['directory_path'])
-        config['participant_id'] = extract_participant_from_path(config['directory_path'])
+        # Generate log file name based on batch processing
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if len(config['selected_participants']) == 1:
+            participant_folder = config['selected_participants'][0][0]
+            config['log_file'] = os.path.join(DEFAULT_LOGS_FOLDER, f"transform_log_{participant_folder}_{timestamp}.txt")
+            config['participant_id'] = participant_folder
+        else:
+            config['log_file'] = os.path.join(DEFAULT_LOGS_FOLDER, f"transform_log_batch_{len(config['selected_participants'])}participants_{timestamp}.txt")
+            config['participant_id'] = "BATCH"
         
         return config
     
-    def _get_directory_path(self):
-        """Get and validate directory path from user."""
-        while True:
-            directory_path = input(f"\n{PROMPTS['directory_path']}").strip()
-            
-            if not directory_path:
-                print("Error: Directory path cannot be empty. Please try again.")
-                continue
-                
-            try:
-                validate_directory(directory_path)
-                find_required_parquet_files(directory_path)
-                return directory_path
-            except (FileNotFoundError, ValueError) as e:
-                print(f"Error: {e}")
-                retry = input("Would you like to try another path? (y/n, default: y): ").strip().lower()
-                if retry in ['n', 'no']:
-                    print("Exiting...")
-                    sys.exit(0)
+    def _get_participant_selection(self):
+        """Get participant selection from user."""
+        print(f"\nDiscovering available participants in {DEFAULT_PARTICIPANTS_FOLDER}...")
+        participants = discover_participants()
+        
+        if not participants:
+            print(f"No participant folders found in {DEFAULT_PARTICIPANTS_FOLDER}.")
+            print("Please ensure the participants directory exists and contains SP* folders.")
+            return []
+        
+        return get_participant_selection(participants)
+    
     
     def _get_processing_mode(self):
         """Get and validate processing mode from user."""
@@ -951,13 +1282,15 @@ class TransformApplication:
         )
         
         self.logger.section_header("Transform Process Started")
-        log_info(f"Processing directory: {config['directory_path']}")
+        log_info(f"Selected participants: {len(config['selected_participants'])}")
+        for folder, path in config['selected_participants']:
+            log_info(f"  - {folder}: {path}")
         log_info(f"Log file: {config['log_file']}")
-        log_info(f"Participant ID: {config['participant_id']}")
         log_info(f"Processing mode: {config['processing_mode']}")
         log_info(f"Row limits: {config['file_row_limits']}")
         log_info(f"Output folder: {config['output_folder']}")
         log_info(f"Metadata path: {config['metadata_path']}")
+        log_info(get_cache_info())
     
     def _process_files(self, config):
         """Execute the main file processing pipeline."""
@@ -965,14 +1298,36 @@ class TransformApplication:
         
         self.processor = ParquetProcessor(config['metadata_path'])
         
-        output_files, total_processed_rows = self.processor.process_directory(
-            config['directory_path'],
-            config['file_row_limits'],
-            config['output_folder'],
-            config['processing_mode']
-        )
+        all_output_files = []
+        total_processed_rows = 0
         
-        config['output_files'] = output_files
+        # Process each selected participant
+        for i, (participant_folder, participant_path) in enumerate(config['selected_participants']):
+            participant_num = i + 1
+            total_participants = len(config['selected_participants'])
+            
+            self.logger.section_header(f"Processing Participant {participant_num}/{total_participants}: {participant_folder}")
+            log_info(f"Participant directory: {participant_path}")
+            
+            try:
+                output_files, processed_rows = self.processor.process_directory(
+                    participant_path,
+                    config['file_row_limits'],
+                    config['output_folder'],
+                    config['processing_mode']
+                )
+                
+                all_output_files.extend(output_files)
+                total_processed_rows += processed_rows
+                
+                log_info(f"✓ Completed {participant_folder}: {len(output_files)} files, {processed_rows:,} rows")
+                
+            except Exception as e:
+                log_error(f"✗ Failed to process {participant_folder}: {e}")
+                print(f"ERROR: Failed to process {participant_folder}: {e}")
+                continue
+        
+        config['output_files'] = all_output_files
         config['total_processed_rows'] = total_processed_rows
     
     def _report_success(self, config):
@@ -986,6 +1341,7 @@ class TransformApplication:
         log_info(f"Total processed rows: {config['total_processed_rows']:,}")
         log_info(f"Output directory: {os.path.abspath(config['output_folder'])}")
         log_info(f"Log file saved: {config['log_file']}")
+        log_info(get_cache_info())
         
         print(f"\n🎉 Processing completed successfully!")
         print(f"📁 Output files: {len(config['output_files'])}")
