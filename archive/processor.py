@@ -173,9 +173,24 @@ class DataFrameBuilder:
             'dc_end_date': dc_end_date_data,
             'dc_end_time': dc_end_time_data,
             'device_position': device_position,
-            'device_timestamp': device_timestamp_data,
-            'skin_temp': df.get('temp', pd.Series([''] * len(df)))
+            'device_timestamp': device_timestamp_data
         }
+        
+        # Add sensor-specific columns based on data type
+        if 'acc' in data_type:
+            # For accelerometer data: read x_g, y_g, z_g and create accel_x, accel_y, accel_z
+            output_data['accel_x'] = df.get('x_g', pd.Series([''] * len(df)))
+            output_data['accel_y'] = df.get('y_g', pd.Series([''] * len(df)))
+            output_data['accel_z'] = df.get('z_g', pd.Series([''] * len(df)))
+        elif 'eda' in data_type:
+            # For EDA data: read eda column and output in eda_us column
+            output_data['eda_us'] = df.get('eda', pd.Series([''] * len(df)))
+        elif 'ibi' in data_type:
+            # For IBI data: read ibi column and output in ibi channel
+            output_data['ibi'] = df.get('ibi', pd.Series([''] * len(df)))
+        elif 'temp' in data_type:
+            # For temperature data: keep original skin_temp column
+            output_data['skin_temp'] = df.get('temp', pd.Series([''] * len(df)))
         
         return pd.DataFrame(output_data)
     
